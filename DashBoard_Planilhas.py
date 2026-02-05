@@ -3,272 +3,266 @@ import plotly.express as px
 import dash
 from dash import dcc, html, Input, Output, dash_table, State
 import os
-import re
 
 app = dash.Dash(__name__)
 
+# Configuração de pastas e arquivos
 CAMINHO_PLANILHAS = "planilhas"
+if not os.path.exists(CAMINHO_PLANILHAS):
+    os.makedirs(CAMINHO_PLANILHAS)
+
 ARQUIVOS = [f for f in os.listdir(CAMINHO_PLANILHAS) if f.endswith(".xlsx")]
 
 def extrair_info(df, coluna):
-    if coluna not in df.columns:
+    coluna_busca = "Imagem do Equipamento Registrada em:" if coluna == "Imagem Registrada:" else coluna
+    if coluna_busca not in df.columns:
         return pd.DataFrame()
-    log = df[coluna].dropna()
+
+    log = df[coluna_busca].dropna().astype(str)
     if log.empty:
         return pd.DataFrame()
+
     extra = log.str.extract(r"(?P<nome>.+) - (?P<datahora>\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})")
-    extra["coluna"] = coluna
     extra["datahora"] = pd.to_datetime(extra["datahora"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-    extra["data"] = extra["datahora"].dt.date
-    extra["index_base"] = log.index
-    return extra.dropna(subset=["nome", "datahora"])
+    extra = extra.dropna(subset=["nome", "datahora"])
+    
+    if extra.empty:
+        return pd.DataFrame()
+
+    extra["data"] = extra["datahora"].dt.normalize()
+    extra["hora"] = extra["datahora"].dt.strftime("%H:%M:%S")
+    extra["semana"] = extra["datahora"].dt.to_period("W").astype(str)
+    
+    nome_limpo = coluna.split(" [Monitoramento]")[0].strip()
+    extra["alterado_no_momento"] = "Imagem Registrada:" if "Imagem do Equipamento" in nome_limpo else nome_limpo
+    extra["index_base"] = extra.index
+    return extra
 
 COLUNAS_MULTIPLAS = [
-    "Última atualização:", "Imagem do Equipamento Registrada em:"
-] + [f"({bloco}) Pergunta {i:02d} [Monitoramento]" for bloco in ["PC", "CE", "DF", "DQ"] for i in range(1, 32)]
+    "Última atualização:",
+    "Imagem Registrada:"
+] + [
+    f"({b}) Pergunta {i:02d} [Monitoramento]"
+    for b in ["PC", "CE", "DF", "DQ"]
+    for i in range(1, 32)
+]
 
 app.layout = html.Div(
     style={"fontFamily": "Arial", "padding": "20px"},
     children=[
-        html.H2("Análise de Alterações"),
-        dcc.Dropdown(
-            id="arquivo_excel",
-            options=[{"label": nome, "value": nome} for nome in ARQUIVOS],
-            value=ARQUIVOS[0] if ARQUIVOS else None,
-            style={"width": "500px", "marginBottom": "20px"},
-        ),
-        dcc.Dropdown(
-            id="tipo_grafico",
-            options=[
-                {"label": "Rosca (Última atualização)", "value": "rosquinha_atualizacao"},
-                {"label": "Rosca (Imagem do Equipamento)", "value": "rosquinha_imagem"},
-                {"label": "Rosca (Multi-Colunas)", "value": "rosquinha_multi"},
-                {"label": "Colunas (por dia)", "value": "colunas"},
-                {"label": "Colunas (por mês)", "value": "colunas_mes"},
-            ],
-            value="rosquinha_atualizacao",
-            clearable=False,
-            style={"width": "400px", "marginBottom": "20px"},
-        ),
+        html.H2("Dashboard de Alterações"),
+
+        html.Div([
+            html.Label("1. Selecione o Arquivo:"),
+            dcc.Dropdown(
+                id="arquivo_excel",
+                options=[{"label": a, "value": a} for a in ARQUIVOS],
+                value=ARQUIVOS[0] if ARQUIVOS else None
+            ),
+        ], style={"width": "400px", "marginBottom": "10px"}),
+
+        html.Div([
+            html.Label("2. Filtro de Semana:"),
+            dcc.Dropdown(id="filtro_semana", placeholder="Todas as semanas"),
+            html.Button("Limpar Semana", id="btn_limpar_semana", n_clicks=0, style={"marginTop": "5px"}),
+        ], style={"width": "400px", "marginBottom": "10px"}),
+
+        # --- NOVO FILTRO DE INTERVALO DE DATAS ---
+        html.Div([
+            html.Label("3. Filtro por Intervalo de Datas:"),
+            html.Br(),
+            dcc.DatePickerRange(
+                id="filtro_data_range",
+                min_date_allowed=None,
+                max_date_allowed=None,
+                start_date=None,
+                end_date=None,
+                display_format="DD/MM/YYYY",
+                clearable=True,
+                style={"marginTop": "5px"}
+            ),
+        ], style={"width": "400px", "marginBottom": "10px"}),
+
+        html.Div([
+            html.Label("4. Tipo de Gráfico:"),
+            dcc.Dropdown(
+                id="tipo_grafico",
+                options=[
+                    {"label": "Colunas (Tags Únicas/Semana)", "value": "colunas_tags_semana"},
+                    {"label": "Rosca (Usuários)", "value": "rosquinha_multi"},
+                    {"label": "Colunas (Dias)", "value": "colunas_dias"},
+                    {"label": "Colunas (Por TAGs)", "value": "rosquinha_tags"},
+                ],
+                value="colunas_tags_semana",
+                clearable=False
+            ),
+        ], style={"width": "400px", "marginBottom": "20px"}),
+
         dcc.Graph(id="grafico"),
-        html.H4("Resumo Mensal de Atualizações", id="titulo_resumo", style={"marginTop": "30px"}),
+
+        html.H4("Resumo de Alterações por TAG", id="titulo_tags", style={"marginTop": "30px"}),
         dash_table.DataTable(
-            id="tabela_quedas_mensais",
-            data=[],
-            columns=[],
-            page_size=12,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "left"},
-            style_header={"fontWeight": "bold"},
+            id="tabela_tags",
+            style_table={'overflowX': 'auto', 'width': '50%'},
+            style_cell={'textAlign': 'center', 'padding': '10px'},
+            style_header={'fontWeight': 'bold', 'backgroundColor': '#f2f2f2'},
+            page_size=10,
+            sort_action="native"
         ),
-        html.H4("Detalhes:", id="titulo_tabela", style={"marginTop": "30px"}),
+
+        html.H4("Resumo Dinâmico", id="titulo_resumo", style={"marginTop": "30px"}),
+        dash_table.DataTable(id="tabela_resumo_dinamico", style_table={'overflowX': 'auto'}, sort_action="native"),
+        
+        html.Div(id="container_soma_total", style={"marginTop": "10px", "width": "450px"}, children=[
+            dash_table.DataTable(
+                id="tabela_soma_total",
+                style_cell={'textAlign': 'center', 'fontWeight': 'bold', 'backgroundColor': '#f9f9f9'},
+                style_header={'backgroundColor': '#e1e1e1'}
+            )
+        ]),
+
+        html.H4("Detalhes das Alterações", id="titulo_tabela", style={"marginTop": "30px"}),
         dash_table.DataTable(
             id="tabela_detalhes",
-            data=[], columns=[], page_size=12,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "left"},
-            style_header={"fontWeight": "bold"},
+            style_table={'overflowX': 'auto'},
+            style_cell={'textAlign': 'left', 'padding': '10px'},
+            style_header={'fontWeight': 'bold'},
+            sort_action="native"
         ),
-        html.Button(
-            "Exportar Tabela",
-            id="btn_exportar",
-            n_clicks=0,
-            style={"marginTop": "10px", "marginBottom": "10px"}
-        ),
+
+        html.Br(),
+        html.Button("Exportar CSV", id="btn_exportar", style={
+            "marginTop": "20px", 
+            "padding": "10px 20px", 
+            "backgroundColor": "#28a745", 
+            "color": "white", 
+            "border": "none", 
+            "borderRadius": "5px",
+            "cursor": "pointer"
+        }),
         dcc.Download(id="download_dataframe_csv"),
     ]
 )
 
+# --- CALLBACK PARA ATUALIZAR OPÇÕES DE SEMANA E LIMITES DO CALENDÁRIO ---
 @app.callback(
-    Output("grafico", "figure"),
-    Output("tabela_detalhes", "data"),
-    Output("tabela_detalhes", "columns"),
-    Output("titulo_tabela", "children"),
-    Output("tabela_quedas_mensais", "data"),
-    Output("tabela_quedas_mensais", "columns"),
-    Input("arquivo_excel", "value"),
-    Input("tipo_grafico", "value"),
-    Input("grafico", "clickData"),
+    [Output("filtro_semana", "options"), Output("filtro_semana", "value"),
+     Output("filtro_data_range", "min_date_allowed"), Output("filtro_data_range", "max_date_allowed")],
+    [Input("arquivo_excel", "value"), Input("btn_limpar_semana", "n_clicks")],
+    State("filtro_semana", "value")
 )
-def atualizar_tudo(arquivo_nome, tipo, clickData):
-    if not arquivo_nome:
-        return dash.no_update, [], [], "Detalhes:", [], []
+def atualizar_limites_filtros(arquivo, n_clicks, semana_atual):
+    if not arquivo: return [], None, None, None
     
-    try:
-        df = pd.read_excel(os.path.join(CAMINHO_PLANILHAS, arquivo_nome), sheet_name=0)
-    except Exception as e:
-        return dash.no_update, [], [], f"Erro ao abrir o arquivo: {e}", [], []
+    df = pd.read_excel(os.path.join(CAMINHO_PLANILHAS, arquivo), sheet_name=0)
+    lista_dfs = [extrair_info(df, c) for c in COLUNAS_MULTIPLAS if c in df.columns or (c=="Imagem Registrada:" and "Imagem do Equipamento Registrada em:" in df.columns)]
+    lista_dfs = [d for d in lista_dfs if not d.empty]
+    
+    if not lista_dfs: return [], None, None, None
+    
+    df_total = pd.concat(lista_dfs, ignore_index=True)
+    
+    semanas = sorted(df_total["semana"].unique())
+    options = [{"label": f"Semana {s}", "value": s} for s in semanas]
+    
+    # Define os limites do calendário baseados nos dados
+    min_d = df_total["data"].min()
+    max_d = df_total["data"].max()
 
-    usar_multiplas = tipo in ["rosquinha_multi", "colunas", "colunas_mes"]
-    df_uso = pd.DataFrame()
+    return options, (None if n_clicks > 0 else semana_atual), min_d, max_d
 
-    dados_quedas = []
-    colunas_quedas = []
-
-    if usar_multiplas:
-        colunas_existentes = list(set(COLUNAS_MULTIPLAS) & set(df.columns))
-        if not colunas_existentes:
-            return dash.no_update, [], [], "Colunas necessárias não encontradas no arquivo.", [], []
-        
-        df_info = pd.concat([extrair_info(df, col) for col in colunas_existentes], ignore_index=True)
-        if df_info.empty:
-            return dash.no_update, [], [], "Nenhum dado para mostrar.", [], []
-
-        df_merged = df_info.merge(df.reset_index(), left_on="index_base", right_on="index", how="left")
-        df_uso = df_merged
-
-        if tipo == "rosquinha_multi":
-            contagem = df_uso["nome"].value_counts().reset_index()
-            contagem.columns = ["nome", "alteracoes"]
-            fig = px.pie(contagem, names="nome", values="alteracoes", hole=0.4,
-                         title="Total de Alterações por Pessoa (Multi-Colunas)")
-
-        elif tipo == "colunas":
-            por_dia = df_uso.groupby(["data", "nome"]).size().reset_index(name="qtd")
-            if por_dia.empty:
-                return dash.no_update, [], [], "Nenhum dado para mostrar.", [], []
-
-            diario = por_dia.groupby("data").agg(
-                pessoas=("nome", lambda x: ", ".join(sorted(set(x)))),
-                pessoas_unicas=("nome", "nunique")
-            ).reset_index()
-
-            fig = px.bar(
-                diario, x="data", y="pessoas_unicas", custom_data=["pessoas"],
-                labels={"data": "Data", "pessoas_unicas": "Nº de Pessoas"},
-                title="Nº de Pessoas que Alteraram por Dia (Multi-Colunas)",
-                color_discrete_sequence=["cornflowerblue"]
-            )
-            fig.update_traces(hovertemplate="<b>Data:</b> %{x}<br><b>Pessoas:</b> %{y}<br><b>Quem Alterou:</b> %{customdata[0]}<extra></extra>")
-            fig.update_layout(xaxis_tickangle=-45)
-
-        else:  # tipo == "colunas_mes"
-            df_uso['mes'] = df_uso['datahora'].dt.to_period('M').astype(str)
-            por_mes = df_uso.groupby(["mes", "nome"]).size().reset_index(name="qtd")
-            if por_mes.empty:
-                return dash.no_update, [], [], "Nenhum dado para mostrar.", [], []
-
-            mensal = por_mes.groupby("mes").agg(
-                total_atualizacoes=("qtd", "sum"),
-                pessoas_unicas=("nome", "nunique"),
-                pessoas=("nome", lambda x: ", ".join(sorted(set(x))))
-            ).reset_index()
-
-            fig = px.bar(
-                mensal, x="mes", y="pessoas_unicas", custom_data=["pessoas"],
-                labels={"mes": "Mês", "pessoas_unicas": "Nº de Pessoas"},
-                title="Nº de Pessoas que Alteraram por Mês (Multi-Colunas)",
-                color_discrete_sequence=["mediumaquamarine"]
-            )
-            fig.update_traces(hovertemplate="<b>Mês:</b> %{x}<br><b>Pessoas:</b> %{y}<br><b>Quem Alterou:</b> %{customdata[0]}<extra></extra>")
-            fig.update_layout(xaxis_tickangle=-45)
-
-            dados_quedas = mensal.to_dict("records")
-            colunas_quedas = [
-                {"name": "Mês", "id": "mes"},
-                {"name": "Pessoas Únicas", "id": "pessoas_unicas"},
-                {"name": "Total de Atualizações", "id": "total_atualizacoes"},
-                {"name": "Pessoas", "id": "pessoas"},
-            ]
-            
-    else:
-        coluna_escolhida = {
-            "rosquinha_atualizacao": "Última atualização:",
-            "rosquinha_imagem": "Imagem do Equipamento Registrada em:"
-        }.get(tipo, "Última atualização:")
-
-        if coluna_escolhida not in df.columns:
-            return dash.no_update, [], [], f"Coluna '{coluna_escolhida}' não encontrada.", [], []
-
-        extra = extrair_info(df, coluna_escolhida)
-        if extra.empty:
-            return dash.no_update, [], [], "Nenhum dado para mostrar.", [], []
-
-        df["nome"] = pd.NA
-        df["datahora"] = pd.NaT
-        df["data"] = pd.NaT
-        df.loc[extra.index, ["nome", "datahora", "data"]] = extra[["nome", "datahora", "data"]]
-        df_uso = df
-
-        contagem = df["nome"].value_counts().reset_index()
-        contagem.columns = ["nome", "alteracoes"]
-        titulo = "Total de Alterações por Pessoa"
-        titulo += " (Última atualização)" if tipo == "rosquinha_atualizacao" else " (Imagem do Equipamento)"
-        fig = px.pie(contagem, names="nome", values="alteracoes", hole=0.4, title=titulo)
-
-    if not clickData:
-        return fig, [], [], "Detalhes:", dados_quedas, colunas_quedas
-
-    if tipo.startswith("rosquinha"):
-        pessoa = clickData["points"][0]["label"]
-        linhas = df_uso[df_uso["nome"].str.contains(rf"\b{re.escape(pessoa)}\b", na=False, regex=True)]
-        if linhas.empty:
-            return fig, [], [], f"Detalhes de {pessoa}:", dados_quedas, colunas_quedas
-
-        col_fixas = ["nome", "TAG", "Descrição", "Área", "datahora"]
-        col_dinamicas = [c for c in linhas.columns if c not in col_fixas and linhas[c].notna().any()]
-        col_final = [c for c in col_fixas + col_dinamicas if c in linhas.columns]
-
-        data = linhas[col_final].dropna(how='all').to_dict("records")
-        columns = [{"name": "Datahora" if c == "datahora" else c.capitalize(), "id": c} for c in col_final]
-        titulo = f"Detalhes de {pessoa}:"
-
-    else:
-        if tipo == "colunas":
-            periodo = pd.to_datetime(clickData["points"][0]["x"]).date()
-            linhas = df_uso[df_uso["data"] == periodo]
-            titulo = f"Alterações em {periodo}:"
-            periodo_para_tabela = periodo
-        else: # "colunas_mes"
-            periodo_str = clickData["points"][0]["x"]
-            linhas = df_uso[df_uso["mes"] == periodo_str]
-            titulo = f"Alterações em {periodo_str}:"
-            periodo_para_tabela = periodo_str
-
-        if linhas.empty:
-            return fig, [], [], f"Detalhes de {periodo_para_tabela}:", dados_quedas, colunas_quedas
-
-        col_fixas = ["nome", "TAG", "Descrição", "Área", "datahora"]
-        col_dinamicas = [c for c in linhas.columns if c not in col_fixas and linhas[c].notna().any()]
-        col_final = [c for c in col_fixas + col_dinamicas if c in linhas.columns]
-
-        data = linhas[col_final].dropna(how='all').to_dict("records")
-        columns = [{"name": "Datahora" if c == "datahora" else c.capitalize(), "id": c} for c in col_final]
-
-    return fig, data, columns, titulo, dados_quedas, colunas_quedas
-
+# --- CALLBACK PRINCIPAL ---
 @app.callback(
-    Output("download_dataframe_csv", "data"),
-    Input("btn_exportar", "n_clicks"),
-    State("tabela_detalhes", "data"),
-    State("tabela_quedas_mensais", "data"),
-    State("tipo_grafico", "value"),
-    prevent_initial_call=True,
+    [Output("grafico", "figure"), Output("tabela_detalhes", "data"), Output("tabela_detalhes", "columns"),
+     Output("titulo_tabela", "children"), Output("tabela_resumo_dinamico", "data"), Output("tabela_resumo_dinamico", "columns"),
+     Output("tabela_tags", "data"), Output("tabela_tags", "columns"), Output("titulo_tags", "style"),
+     Output("titulo_resumo", "children"), Output("tabela_soma_total", "data"), Output("tabela_soma_total", "columns")],
+    [Input("arquivo_excel", "value"), 
+     Input("tipo_grafico", "value"), 
+     Input("filtro_semana", "value"), 
+     Input("filtro_data_range", "start_date"), # Data Início
+     Input("filtro_data_range", "end_date"),   # Data Fim
+     Input("grafico", "clickData")]
 )
-def exportar_tabela(n_clicks, tabela_detalhes_data, tabela_mensal_data, tipo_grafico):
-    if n_clicks > 0:
-        df_exportar = pd.DataFrame()
-        filename = "dados_tabela.csv"
+def atualizar_dashboard(arquivo, tipo, semana_sel, start_date, end_date, click):
+    if not arquivo: return dash.no_update, [], [], "", [], [], [], [], {"display": "none"}, "Resumo", [], []
+
+    df_original = pd.read_excel(os.path.join(CAMINHO_PLANILHAS, arquivo), sheet_name=0)
+    lista_eventos = [extrair_info(df_original, c) for c in COLUNAS_MULTIPLAS if c in df_original.columns or (c=="Imagem Registrada:" and "Imagem do Equipamento Registrada em:" in df_original.columns)]
+    lista_eventos = [d for d in lista_eventos if not d.empty]
+
+    if not lista_eventos: return px.pie(title="Sem dados"), [], [], "Sem dados", [], [], [], [], {"display": "none"}, "Resumo", [], []
+
+    df_eventos = pd.concat(lista_eventos, ignore_index=True)
+    
+    # --- FILTRAGEM ---
+    if semana_sel: 
+        df_eventos = df_eventos[df_eventos["semana"] == semana_sel]
+    
+    if start_date and end_date:
+        # Converter dates do componente para datetime
+        df_eventos = df_eventos[(df_eventos["data"] >= start_date) & (df_eventos["data"] <= end_date)]
+    
+    df_vinculado = df_eventos.merge(df_original[["TAG"]].reset_index(), left_on="index_base", right_on="index", how="left")
+
+    # Lógica de processamento (Igual à anterior, usando o df_vinculado filtrado)
+    tags_data, tags_cols, tags_style = [], [], {"display": "none"}
+    res_data, res_cols, titulo_res = [], [], "Resumo Diário"
+    soma_data, soma_cols = [], []
+
+    if tipo == "colunas_tags_semana":
+        df_semanal = df_vinculado.groupby("semana").agg(tags_unicas=("TAG", "nunique")).reset_index()
+        fig = px.bar(df_semanal, x="semana", y="tags_unicas", text="tags_unicas", title="Tags Únicas Alteradas por Semana")
+        titulo_res = "Resumo Semanal"
+        res_df = df_vinculado.groupby("semana").agg(total_alteracoes=("nome", "count"), tags_unicas=("TAG", "nunique"), pessoas_unicas=("nome", "nunique"), usuarios=("nome", lambda x: ", ".join(sorted(set(x))))).reset_index()
+        res_data = res_df.to_dict("records")
+        res_cols = [{"name": n, "id": i} for n, i in zip(["Semana", "Total Alt.", "Tags Únicas", "Pessoas", "Usuários"], ["semana", "total_alteracoes", "tags_unicas", "pessoas_unicas", "usuarios"])]
+        soma_data = [{"label": "SOMA TOTAL", "valor_alt": res_df["total_alteracoes"].sum(), "valor_tags": df_vinculado["TAG"].nunique()}]
+        soma_cols = [{"name": "", "id": "label"}, {"name": "Total Alterações", "id": "valor_alt"}, {"name": "Total Tags Únicas", "id": "valor_tags"}]
+
+    elif tipo == "rosquinha_multi":
+        res_user = df_vinculado.groupby("nome").agg(total_alt=("nome", "count"), tags_unicas=("TAG", "nunique")).reset_index().sort_values("total_alt", ascending=False)
+        fig = px.pie(res_user, names="nome", values="total_alt", hole=0.4, title="Alterações por Usuário")
+        titulo_res = "Resumo Geral por Usuário"
+        res_data = res_user.to_dict("records")
+        res_cols = [{"name": "Nome do Usuário", "id": "nome"}, {"name": "Total de Alterações", "id": "total_alt"}, {"name": "Tags Únicas Alteradas", "id": "tags_unicas"}]
+        soma_data = [{"label": "SOMA TOTAL", "valor_alt": res_user["total_alt"].sum(), "valor_tags": df_vinculado["TAG"].nunique()}]
+        soma_cols = [{"name": "", "id": "label"}, {"name": "Total Alterações", "id": "valor_alt"}, {"name": "Total Tags Únicas", "id": "valor_tags"}]
+
+    elif tipo == "colunas_dias":
+        diario = df_vinculado.groupby("data").agg(total_alteracoes=("nome", "count"), tags_unicas=("TAG", "nunique"), pessoas_unicas=("nome", "nunique"), usuarios=("nome", lambda x: ", ".join(sorted(set(x))))).reset_index()
+        diario["data_str"] = diario["data"].dt.strftime("%d/%m/%Y")
+        fig = px.bar(diario, x="data_str", y="total_alteracoes", text="total_alteracoes", title="Volume de Alterações por Dia")
+        res_data = diario.to_dict("records")
+        res_cols = [{"name": n, "id": i} for n, i in zip(["Data", "Total Alt.", "Tags Únicas", "Pessoas", "Usuários"], ["data_str", "total_alteracoes", "tags_unicas", "pessoas_unicas", "usuarios"])]
+        titulo_res = "Resumo Diário"
+        soma_data = [{"label": "SOMA TOTAL", "valor_alt": diario["total_alteracoes"].sum(), "valor_tags": df_vinculado["TAG"].nunique()}]
+        soma_cols = [{"name": "", "id": "label"}, {"name": "Total Alterações", "id": "valor_alt"}, {"name": "Total Tags Únicas", "id": "valor_tags"}]
+
+    elif tipo == "rosquinha_tags":
+        contagem_tags = df_vinculado.groupby("TAG").size().reset_index(name="Total").sort_values("Total", ascending=False)
+        fig = px.bar(contagem_tags, x="TAG", y="Total", text="Total", title="Alterações por TAG")
+        tags_data = contagem_tags.to_dict("records")
+        tags_cols = [{"name": i, "id": i} for i in contagem_tags.columns]
+        tags_style = {"display": "block", "marginTop": "30px"}
+        soma_data = [{"label": "SOMA TOTAL", "valor_alt": contagem_tags["Total"].sum(), "valor_tags": df_vinculado["TAG"].nunique()}]
+        soma_cols = [{"name": "", "id": "label"}, {"name": "Total Alterações", "id": "valor_alt"}, {"name": "Total Tags Únicas", "id": "valor_tags"}]
+
+    data_det, cols_det, titulo_det = [], [], "Clique no gráfico para ver detalhes"
+    if click:
+        valor = click["points"][0].get("label") or click["points"][0].get("x")
+        if tipo == "colunas_dias": fil = df_vinculado[df_vinculado["data"].dt.strftime("%d/%m/%Y") == valor]
+        elif tipo == "colunas_tags_semana": fil = df_vinculado[df_vinculado["semana"] == valor]
+        elif tipo == "rosquinha_tags": fil = df_vinculado[df_vinculado["TAG"] == valor]
+        else: fil = df_vinculado[df_vinculado["nome"] == valor]
         
-        # Lógica para exportar os nomes das pessoas que alteraram no mês
-        if tipo_grafico == "colunas_mes" and tabela_mensal_data:
-            df_mensal = pd.DataFrame(tabela_mensal_data)
-            df_exportar = df_mensal[['mes', 'pessoas']]
-            df_exportar.rename(columns={'mes': 'Mês', 'pessoas': 'Pessoas'}, inplace=True)
-            filename = "pessoas_por_mes.csv"
-        # Comportamento padrão para os outros filtros
-        elif tabela_detalhes_data:
-            df_exportar = pd.DataFrame(tabela_detalhes_data)
-            filename = "detalhes_tabela.csv"
-        
-        if not df_exportar.empty:
-            return dcc.send_data_frame(
-                df_exportar.to_csv,
-                filename,
-                index=False,
-                sep=';'
-            )
-    return None
+        if not fil.empty:
+            det = fil.merge(df_original[["TAG", "Área", "Tipo", "Sistema"]].reset_index(), left_on="index_base", right_on="index", how="left")
+            cols_det = [{"name": n, "id": i} for n, i in zip(["TAG", "Área", "Sistema", "Tipo", "Pergunta/Campo", "Data", "Hora"], ["TAG_y", "Área", "Sistema", "Tipo", "alterado_no_momento", "data", "hora"])]
+            data_det = det.to_dict("records")
+            titulo_det = f"Detalhes de: {valor}"
+
+    return fig, data_det, cols_det, titulo_det, res_data, res_cols, tags_data, tags_cols, tags_style, titulo_res, soma_data, soma_cols
 
 if __name__ == "__main__":
     app.run(debug=True)
